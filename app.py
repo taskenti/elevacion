@@ -3,68 +3,86 @@ import gpxpy
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
-import io
 
-# --- CONFIGURACIÓN DE PÁGINA ESTILO KOMOOT ---
+# --- 1. CONFIGURACIÓN DE PÁGINA (WIDE MODE PARA MAPAS/GRÁFICOS) ---
 st.set_page_config(
-    page_title="Altimetría Pro",
-    page_icon="⛰️",
-    layout="centered", # Komoot usa contenedores centrados para enfoque
+    page_title="Ruta GPX",
+    page_icon="🚲",
+    layout="centered",
     initial_sidebar_state="collapsed"
 )
 
-# Inyectar CSS para imitar la UI limpia de Komoot
+# --- 2. ESTILOS CSS AVANZADOS (KOMOOT CLONE) ---
 st.markdown("""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap');
         
+        /* Reset general */
         html, body, [class*="css"]  {
             font-family: 'Open Sans', sans-serif;
+            background-color: #ffffff; /* Fondo blanco puro Komoot */
             color: #333333;
         }
-        .stApp {
-            background-color: #f8f9fa; /* Gris muy suave, típico de apps modernas */
-        }
-        h1 {
+        
+        /* Ocultar elementos nativos de Streamlit para limpiar la UI */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        
+        /* Título Principal */
+        .main-title {
+            font-size: 24px;
             font-weight: 700;
-            letter-spacing: -0.5px;
-            color: #2c3e50;
+            color: #262626;
+            margin-bottom: 5px;
         }
-        h3 {
+        
+        /* Contenedor de Métricas (Flexbox simple) */
+        .stats-container {
+            display: flex;
+            justify-content: space-between;
+            padding: 20px 0;
+            border-bottom: 1px solid #e6e6e6;
+            margin-bottom: 20px;
+        }
+        
+        .stat-box {
+            text-align: left;
+        }
+        
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #262626;
+            line-height: 1.2;
+        }
+        
+        .stat-label {
+            font-size: 13px;
+            color: #757575; /* Gris medio Komoot */
+            font-weight: 400;
+        }
+        
+        .unit {
+            font-size: 14px;
             font-weight: 600;
-            color: #566573;
-            font-size: 1.1rem !important;
-            margin-top: 20px !important;
+            color: #555;
         }
-        .metric-container {
-            background-color: white;
-            padding: 15px;
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-            text-align: center;
-            border: 1px solid #e9ecef;
+
+        /* Ajustes del contenedor del gráfico */
+        .js-plotly-plot {
+            border-radius: 0px;
         }
-        .metric-val {
-            font-size: 22px;
-            font-weight: 700;
-            color: #2c3e50;
-        }
-        .metric-lbl {
-            font-size: 11px;
-            color: #8899a6;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-top: 4px;
-        }
-        /* Botones personalizados */
-        .stButton button {
-            border-radius: 6px;
+        
+        /* Botón de carga personalizado */
+        .stFileUploader label {
+            font-size: 14px;
             font-weight: 600;
         }
     </style>
 """, unsafe_allow_html=True)
 
-# --- LÓGICA DE PROCESAMIENTO (Igual que antes, robusta) ---
+# --- 3. LÓGICA DE PROCESAMIENTO ROBUSTA ---
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371.009
@@ -75,21 +93,29 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
     return R * c
 
-def process_gpx(file, smoothing=5):
-    gpx = gpxpy.parse(file)
+def process_gpx(file):
+    try:
+        gpx = gpxpy.parse(file)
+    except Exception:
+        return None, None
+
     points = []
     for track in gpx.tracks:
         for segment in track.segments:
             for point in segment.points:
-                points.append({'lat': point.latitude, 'lon': point.longitude, 'ele': point.elevation})
+                points.append({
+                    'lat': point.latitude, 
+                    'lon': point.longitude, 
+                    'ele': point.elevation
+                })
     
     if not points: return None, None
     
     df = pd.DataFrame(points)
     
-    # Suavizado inteligente (clave para calidad "Komoot")
-    if smoothing > 1:
-        df['ele'] = df['ele'].rolling(window=smoothing, center=True, min_periods=1).mean()
+    # SUAVIZADO: Komoot suaviza mucho para evitar ruido
+    # Ventana de 15 puntos para una curva muy limpia
+    df['ele_smooth'] = df['ele'].rolling(window=15, center=True, min_periods=1).mean()
         
     distances = [0]
     gain, loss = 0, 0
@@ -97,168 +123,144 @@ def process_gpx(file, smoothing=5):
     for i in range(1, len(df)):
         d = haversine_distance(df.loc[i-1,'lat'], df.loc[i-1,'lon'], df.loc[i,'lat'], df.loc[i,'lon'])
         distances.append(distances[-1] + d)
-        diff = df.loc[i, 'ele'] - df.loc[i-1, 'ele']
-        if diff > 0.5: gain += diff
-        elif diff < -0.5: loss += diff
+        
+        # Calcular desnivel sobre la elevación suavizada (más realista)
+        diff = df.loc[i, 'ele_smooth'] - df.loc[i-1, 'ele_smooth']
+        if diff > 0: gain += diff
+        else: loss += diff
             
     df['dist_km'] = distances
     
-    # Calcular rangos para ajuste perfecto de ejes
-    ele_min = df['ele'].min()
-    ele_max = df['ele'].max()
-    ele_buffer = (ele_max - ele_min) * 0.1 # 10% de margen
-    
+    # Estadísticas
     stats = {
         'dist': distances[-1],
         'gain': gain,
         'loss': loss,
-        'min': ele_min,
-        'max': ele_max,
-        'y_range': [ele_min - ele_buffer, ele_max + ele_buffer]
+        'min_ele': df['ele_smooth'].min(),
+        'max_ele': df['ele_smooth'].max()
     }
+    
+    # Rango Y inteligente (buffer arriba y abajo)
+    ele_range = stats['max_ele'] - stats['min_ele']
+    stats['y_min'] = stats['min_ele'] - (ele_range * 0.05)
+    stats['y_max'] = stats['max_ele'] + (ele_range * 0.1) # Un poco más de aire arriba
+    
     return df, stats
 
-# --- UI PRINCIPAL ---
+# --- 4. INTERFAZ DE USUARIO ---
 
-st.title("Generador de Perfil GPX")
-st.markdown("Crea perfiles de altimetría con calidad de publicación.")
+st.markdown('<div class="main-title">Perfil de Elevación</div>', unsafe_allow_html=True)
 
-col_upload, col_conf = st.columns([1, 2])
-with col_upload:
-    uploaded_file = st.file_uploader("Sube archivo GPX", type=["gpx"])
-
-# Configuración de diseño (Sidebar o Inline)
-with st.expander("🎨 Personalizar Diseño del Gráfico", expanded=False):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        line_color = st.color_picker("Color Línea", "#36454F") # Charcoal Komoot
-    with c2:
-        fill_color = st.color_picker("Color Relleno", "#85C1E9") # Azul suave
-    with c3:
-        fill_opacity = st.slider("Opacidad", 0.0, 1.0, 0.3)
-    
-    st.caption("Tip: Para estilo Komoot, usa líneas oscuras y rellenos suaves o grises.")
+uploaded_file = st.file_uploader("", type=["gpx"], help="Arrastra tu archivo GPX aquí")
 
 if uploaded_file:
     df, stats = process_gpx(uploaded_file)
     
     if df is not None:
-        # 1. Métricas Estilo Tarjeta
-        st.markdown("<br>", unsafe_allow_html=True)
-        m1, m2, m3, m4 = st.columns(4)
         
-        def card(label, val):
-            return f"""<div class="metric-container"><div class="metric-val">{val}</div><div class="metric-lbl">{label}</div></div>"""
-            
-        m1.markdown(card("Distancia", f"{stats['dist']:.1f} <span style='font-size:12px'>km</span>"), unsafe_allow_html=True)
-        m2.markdown(card("Desnivel +", f"{int(stats['gain'])} <span style='font-size:12px'>m</span>"), unsafe_allow_html=True)
-        m3.markdown(card("Desnivel -", f"{int(abs(stats['loss']))} <span style='font-size:12px'>m</span>"), unsafe_allow_html=True)
-        m4.markdown(card("Altitud Max", f"{int(stats['max'])} <span style='font-size:12px'>m</span>"), unsafe_allow_html=True)
+        # --- A. MÉTRICAS ESTILO KOMOOT (HTML Puro) ---
+        # Usamos HTML para controlar exactamente el espaciado y la fuente
+        st.markdown(f"""
+        <div class="stats-container">
+            <div class="stat-box">
+                <div class="stat-label">Distancia</div>
+                <div class="stat-value">{stats['dist']:.1f} <span class="unit">km</span></div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Desnivel positivo</div>
+                <div class="stat-value">{int(stats['gain'])} <span class="unit">m</span></div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Desnivel negativo</div>
+                <div class="stat-value">{int(abs(stats['loss']))} <span class="unit">m</span></div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Altitud máx</div>
+                <div class="stat-value">{int(stats['max_ele'])} <span class="unit">m</span></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        # 2. Generación del Gráfico Plotly
-        st.markdown("### Perfil de Elevación")
-        
-        # Convertir hex a rgba
-        hex_c = fill_color.lstrip('#')
-        rgb = tuple(int(hex_c[i:i+2], 16) for i in (0, 2, 4))
-        fill_rgba = f"rgba({rgb[0]},{rgb[1]},{rgb[2]},{fill_opacity})"
+        # --- B. GRÁFICO EXACTO ---
         
         fig = go.Figure()
         
+        # Línea y Relleno
         fig.add_trace(go.Scatter(
-            x=df['dist_km'], y=df['ele'],
+            x=df['dist_km'], 
+            y=df['ele_smooth'],
             mode='lines',
-            line=dict(color=line_color, width=2.5),
-            fill='tozeroy',
-            fillcolor=fill_rgba,
+            line=dict(
+                color='#333333', # Gris casi negro (estándar navegación)
+                width=1.5        # Línea fina y elegante
+            ),
+            fill='tozeroy',      # Rellenar hasta el eje 0 (luego recortamos con el eje Y)
+            fillcolor='rgba(51, 51, 51, 0.1)', # Gris muy suave transparente
             hoverinfo='x+y',
-            hovertemplate='%{y:.0f}m<br>%{x:.1f}km<extra></extra>' # Tooltip limpio
+            hovertemplate='<b>%{y:.0f} m</b><br>%{x:.1f} km<extra></extra>'
         ))
         
-        # Layout profesional "Komoot Style"
+        # Layout Minimalista
         fig.update_layout(
             autosize=True,
-            height=400,
-            margin=dict(l=40, r=20, t=20, b=40),
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
+            height=350, # Altura compacta típica de perfiles web
+            margin=dict(l=0, r=0, t=10, b=0), # Sin márgenes externos
+            plot_bgcolor='white',
+            paper_bgcolor='white',
             
+            # Eje X (Distancia)
             xaxis=dict(
-                title="Distancia (km)",
-                title_font=dict(size=12, color='#888'),
-                showgrid=True,
-                gridcolor='#eee',
-                gridwidth=1,
+                showgrid=False,      # Komoot no suele tener grid vertical fuerte
                 zeroline=False,
-                tickfont=dict(color='#666', size=11),
-                fixedrange=False # Permite zoom usuario
+                showline=True,       # Línea base sutil
+                linecolor='#e0e0e0',
+                tickfont=dict(size=11, color='#757575', family='Open Sans'),
+                ticks="outside",
+                ticklen=5,
+                title="",            # Sin título para limpieza (se entiende por contexto)
+                fixedrange=True      # Fijo para evitar zooms accidentales si se quiere estático
             ),
             
+            # Eje Y (Elevación)
             yaxis=dict(
-                title="Altitud (m)",
-                title_font=dict(size=12, color='#888'),
-                showgrid=True,
-                gridcolor='#eee',
+                showgrid=True,       # Grid horizontal SÍ (guía visual de altura)
+                gridcolor='#f0f0f0', # Grid muy sutil
                 gridwidth=1,
                 zeroline=False,
-                tickfont=dict(color='#666', size=11),
-                range=stats['y_range'], # AJUSTE INTELIGENTE DE EJES
-                fixedrange=False
+                showline=False,      # Sin línea vertical izquierda
+                tickfont=dict(size=11, color='#757575', family='Open Sans'),
+                range=[stats['y_min'], stats['y_max']], # Zoom inteligente
+                side='right',        # Etiquetas a la derecha (estilo moderno)
+                fixedrange=True
             ),
-            hovermode="x unified"
+            hovermode="x unified",
+            showlegend=False
         )
         
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+        # Renderizar
+        st.plotly_chart(fig, use_container_width=True, config={
+            'displayModeBar': True,
+            'displaylogo': False,
+            'modeBarButtonsToRemove': ['zoom2d', 'pan2d', 'select2d', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d', 'resetScale2d'],
+            'toImageButtonOptions': {
+                'format': 'png', # Uno de png, svg, jpeg, webp
+                'filename': 'mi_perfil_gpx',
+                'height': 500,
+                'width': 1000,
+                'scale': 2 # Alta resolución
+            }
+        })
         
-        # 3. Zona de Descargas
-        st.markdown("### Exportar Gráfico")
-        st.markdown("Descarga el perfil en alta calidad PNG para compartir en redes sociales.")
-        
-        d1, d2, d3 = st.columns(3)
-        
-        # Función auxiliar para convertir a bytes
-        def to_png_bytes(figure, transparent=False, bg_color="white"):
-            # Configuramos el fondo para la descarga
-            img_fig = go.Figure(figure) # Copia para no alterar la vista
-            if not transparent:
-                img_fig.update_layout(plot_bgcolor=bg_color, paper_bgcolor=bg_color)
-            else:
-                img_fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
-                
-            return img_fig.to_image(format="png", width=1200, height=600, scale=2)
-
-        try:
-            # Opción 1: Transparente (Ideal overlays)
-            btn_trans = d1.download_button(
-                label="🖼️ PNG Transparente",
-                data=to_png_bytes(fig, transparent=True),
-                file_name="perfil_transparente.png",
-                mime="image/png"
-            )
-            
-            # Opción 2: Fondo Blanco (Clásico Komoot Web)
-            btn_white = d2.download_button(
-                label="📄 PNG Fondo Blanco",
-                data=to_png_bytes(fig, transparent=False, bg_color="white"),
-                file_name="perfil_blanco.png",
-                mime="image/png"
-            )
-            
-            # Opción 3: Fondo Oscuro (Modo noche)
-            btn_dark = d3.download_button(
-                label="🌑 PNG Fondo Oscuro",
-                data=to_png_bytes(fig, transparent=False, bg_color="#1e1e1e"),
-                file_name="perfil_oscuro.png",
-                mime="image/png"
-            )
-            
-        except Exception as e:
-            st.warning("⚠️ Para habilitar la descarga de imágenes estáticas, instala 'kaleido': `pip install kaleido`")
-            st.error(f"Error técnico: {e}")
+        st.caption("💡 Pasa el ratón por el gráfico y haz clic en el icono de la cámara (arriba a la derecha) para descargar la imagen en Alta Resolución.")
 
     else:
-        st.error("Archivo GPX inválido o vacío.")
+        st.error("El archivo no contiene datos de elevación válidos.")
 
 else:
-    # Empty State elegante
-    st.info("👆 Sube un archivo .GPX para ver la magia.")
+    # Empty state minimalista
+    st.markdown("""
+    <div style="background-color: #f9f9f9; padding: 40px; border-radius: 8px; text-align: center; border: 1px dashed #ccc;">
+        <h4 style="color: #555; margin:0;">Sube un archivo GPX para comenzar</h4>
+        <p style="color: #999; font-size: 14px;">Se generará el perfil de altimetría automáticamente.</p>
+    </div>
+    """, unsafe_allow_html=True)
